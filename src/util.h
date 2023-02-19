@@ -106,5 +106,21 @@ static SECP256K1_INLINE void *checked_malloc(const secp256k1_callback* cb, size_
 # endif
 SECP256K1_GNUC_EXT typedef unsigned __int128 uint128_t;
 #endif
+/** Semantics like memcmp. Variable-time.
+ *
+ * We use this to avoid possible compiler bugs with memcmp, e.g.
+ * https://gcc.gnu.org/bugzilla/show_bug.cgi?id=95189
+ */
+static SECP256K1_INLINE int secp256k1_memcmp_var(const void *s1, const void *s2, size_t n) {
+    const unsigned char *p1 = s1, *p2 = s2;
+    size_t i;
 
+    for (i = 0; i < n; i++) {
+        int diff = p1[i] - p2[i];
+        if (diff != 0) {
+            return diff;
+        }
+    }
+    return 0;
+}
 #endif

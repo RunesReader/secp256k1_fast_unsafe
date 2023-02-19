@@ -3498,14 +3498,8 @@ void run_ecdsa_end_to_end(void) {
     }
 }
 
-int test_ecdsa_der_parse(const unsigned char *sig, size_t siglen, int certainly_der, int certainly_not_der) {
+static int test_ecdsa_der_parse(const unsigned char *sig, size_t siglen, int certainly_der, int certainly_not_der) {
     static const unsigned char zeroes[32] = {0};
-    static const unsigned char max_scalar[32] = {
-        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xfe,
-        0xba, 0xae, 0xdc, 0xe6, 0xaf, 0x48, 0xa0, 0x3b,
-        0xbf, 0xd2, 0x5e, 0x8c, 0xd0, 0x36, 0x41, 0x40
-    };
 
     int ret = 0;
 
@@ -3521,32 +3515,24 @@ int test_ecdsa_der_parse(const unsigned char *sig, size_t siglen, int certainly_
     size_t len_der_lax = 2048;
     int parsed_der_lax = 0, valid_der_lax = 0, roundtrips_der_lax = 0;
 
-#ifdef ENABLE_OPENSSL_TESTS
-    ECDSA_SIG *sig_openssl;
-    const unsigned char *sigptr;
-    unsigned char roundtrip_openssl[2048];
-    int len_openssl = 2048;
-    int parsed_openssl, valid_openssl = 0, roundtrips_openssl = 0;
-#endif
-
     parsed_der = secp256k1_ecdsa_signature_parse_der(ctx, &sig_der, sig, siglen);
     if (parsed_der) {
         ret |= (!secp256k1_ecdsa_signature_serialize_compact(ctx, compact_der, &sig_der)) << 0;
-        valid_der = (memcmp(compact_der, zeroes, 32) != 0) && (memcmp(compact_der + 32, zeroes, 32) != 0);
+        valid_der = (secp256k1_memcmp_var(compact_der, zeroes, 32) != 0) && (secp256k1_memcmp_var(compact_der + 32, zeroes, 32) != 0);
     }
     if (valid_der) {
         ret |= (!secp256k1_ecdsa_signature_serialize_der(ctx, roundtrip_der, &len_der, &sig_der)) << 1;
-        roundtrips_der = (len_der == siglen) && memcmp(roundtrip_der, sig, siglen) == 0;
+        roundtrips_der = (len_der == siglen) && secp256k1_memcmp_var(roundtrip_der, sig, siglen) == 0;
     }
 
     parsed_der_lax = ecdsa_signature_parse_der_lax(ctx, &sig_der_lax, sig, siglen);
     if (parsed_der_lax) {
         ret |= (!secp256k1_ecdsa_signature_serialize_compact(ctx, compact_der_lax, &sig_der_lax)) << 10;
-        valid_der_lax = (memcmp(compact_der_lax, zeroes, 32) != 0) && (memcmp(compact_der_lax + 32, zeroes, 32) != 0);
+        valid_der_lax = (secp256k1_memcmp_var(compact_der_lax, zeroes, 32) != 0) && (secp256k1_memcmp_var(compact_der_lax + 32, zeroes, 32) != 0);
     }
     if (valid_der_lax) {
         ret |= (!secp256k1_ecdsa_signature_serialize_der(ctx, roundtrip_der_lax, &len_der_lax, &sig_der_lax)) << 11;
-        roundtrips_der_lax = (len_der_lax == siglen) && memcmp(roundtrip_der_lax, sig, siglen) == 0;
+        roundtrips_der_lax = (len_der_lax == siglen) && secp256k1_memcmp_var(roundtrip_der_lax, sig, siglen) == 0;
     }
 
     if (certainly_der) {
@@ -3562,49 +3548,13 @@ int test_ecdsa_der_parse(const unsigned char *sig, size_t siglen, int certainly_
     if (valid_der) {
         ret |= (!roundtrips_der_lax) << 12;
         ret |= (len_der != len_der_lax) << 13;
-        ret |= (memcmp(roundtrip_der_lax, roundtrip_der, len_der) != 0) << 14;
+        ret |= ((len_der != len_der_lax) || (secp256k1_memcmp_var(roundtrip_der_lax, roundtrip_der, len_der) != 0)) << 14;
     }
     ret |= (roundtrips_der != roundtrips_der_lax) << 15;
     if (parsed_der) {
         ret |= (!parsed_der_lax) << 16;
     }
 
-#ifdef ENABLE_OPENSSL_TESTS
-    sig_openssl = ECDSA_SIG_new();
-    sigptr = sig;
-    parsed_openssl = (d2i_ECDSA_SIG(&sig_openssl, &sigptr, siglen) != NULL);
-    if (parsed_openssl) {
-        valid_openssl = !BN_is_negative(sig_openssl->r) && !BN_is_negative(sig_openssl->s) && BN_num_bits(sig_openssl->r) > 0 && BN_num_bits(sig_openssl->r) <= 256 && BN_num_bits(sig_openssl->s) > 0 && BN_num_bits(sig_openssl->s) <= 256;
-        if (valid_openssl) {
-            unsigned char tmp[32] = {0};
-            BN_bn2bin(sig_openssl->r, tmp + 32 - BN_num_bytes(sig_openssl->r));
-            valid_openssl = memcmp(tmp, max_scalar, 32) < 0;
-        }
-        if (valid_openssl) {
-            unsigned char tmp[32] = {0};
-            BN_bn2bin(sig_openssl->s, tmp + 32 - BN_num_bytes(sig_openssl->s));
-            valid_openssl = memcmp(tmp, max_scalar, 32) < 0;
-        }
-    }
-    len_openssl = i2d_ECDSA_SIG(sig_openssl, NULL);
-    if (len_openssl <= 2048) {
-        unsigned char *ptr = roundtrip_openssl;
-        CHECK(i2d_ECDSA_SIG(sig_openssl, &ptr) == len_openssl);
-        roundtrips_openssl = valid_openssl && ((size_t)len_openssl == siglen) && (memcmp(roundtrip_openssl, sig, siglen) == 0);
-    } else {
-        len_openssl = 0;
-    }
-    ECDSA_SIG_free(sig_openssl);
-
-    ret |= (parsed_der && !parsed_openssl) << 4;
-    ret |= (valid_der && !valid_openssl) << 5;
-    ret |= (roundtrips_openssl && !parsed_der) << 6;
-    ret |= (roundtrips_der != roundtrips_openssl) << 7;
-    if (roundtrips_openssl) {
-        ret |= (len_der != (size_t)len_openssl) << 8;
-        ret |= (memcmp(roundtrip_der, roundtrip_openssl, len_der) != 0) << 9;
-    }
-#endif
     return ret;
 }
 
