@@ -551,6 +551,528 @@ int secp256k1_ec_pubkey_combine(const secp256k1_context* ctx, secp256k1_pubkey *
     return 1;
 }
 
+/* This works the same as the default ecmult_gen table except that:         */
+/* 1. No blinding is applied.  This means the first addition can be         */
+/*    replaced with a load and zero-value windows can be skipped.           */
+/* 2. The window size can be variably defined, trading memory for speed.    */
+/* 3. To save space, the ecmult computation converts the privkey scalar     */
+/*    to a signed digit form using the algorithm described by Bodo Moller   */
+/*    in `Securing Elliptic Curve Point Multiplication Against              */
+/*    Side-Channel Attacks` (Vol 2200, Lecture Notes in Computer Science).  */
+/*    It's similar to wNAF but with fixed window sizes and it doesn't care  */
+/*    if the current window value is odd or even.                           */
+/*                                                                          */
+/* The final table size will be 64 bytes per table entry.                   */
+/* The exact number of table entries is:                                    */
+/*     floor(256/bits) * 2^(bits - 1)       [Size of full rows]             */
+/*   + 2^(256 % bits)                       [Final smaller row]             */
+/*                                                                          */
+/* Various window bit sizes and their memory requirements:                  */
+/*    4 bits =     <0.1 MB final +   <0.1 MB setup; 65 rows                 */
+/*    8 bits =      0.3 MB final +   <0.1 MB setup; 33 rows                 */
+/*   10 bits =      0.8 MB final +    0.1 MB setup; 26 rows                 */
+/*   12 bits =      2.6 MB final +    0.3 MB setup; 22 rows                 */
+/*   14 bits =      9.0 MB final +    1.3 MB setup; 19 rows                 */
+/*   16 bits =     32.0 MB final +    5.1 MB setup; 17 rows                 */
+/*   17 bits =     60.0 MB final +   10.3 MB setup; 16 rows                 */
+/*   18 bits =    112.0 MB final +   20.5 MB setup; 15 rows                 */
+/*   19 bits =    208.0 MB final +   41.0 MB setup; 14 rows                 */
+/*   20 bits =    388.0 MB final +   82.0 MB setup; 13 rows                 */
+/*   21 bits =    768.0 MB final +  164.0 MB setup; 13 rows                 */
+/*   22 bits =   1409.0 MB final +  328.0 MB setup; 12 rows                 */
+/*   23 bits =   2816.0 MB final +  656.1 MB setup; 12 rows                 */
+/*   24 bits =   5124.0 MB final + 1312.2 MB setup; 11 rows                 */
+/*                                                                          */
+/* The maximum number of addition operations to compute a pubkey is equal   */
+/*   to the number of rows in the precomputed table as each row represents  */
+/*   all the possible values of a w-bit window of the privkey scalar.       */
+/* The actual number of additions may be less as the first window addition  */
+/*   is replaced by a load and any zero valued w-bit windows are skipped.   */
+struct secp256k1_ecmult_big_context_struct {
+    /* Precomputed window size in bits. */
+    const unsigned int bits;
+
+    /* Number of precomputed windows; the precomp table will have this many rows.   */
+    const unsigned int windows;
+
+    /* This table will have floor(256/bits) + 1 rows, each with 2^(bits-1) entries. */
+    /*                                                                              */
+    /* Each row's values will be between {offset, offset + 2^(bits-1)}.             */
+    /* Each row's offset will be 2^(bits) times the previous, or 2^(row*bits).      */
+    /* Each row's values may be treated as positive or negative, meaning that it    */
+    /*   represents 2^(bits) effective values for use in signed digit form.         */
+    /* Building upon this, a w-bit window value of N is stored at row[abs(N)-1]     */
+    /*   with the the result of row[abs(N)-1] being negated if N is negative.       */
+    /* Keep in mind that there are no zero/point at infinity values in precomp.     */
+    /*   If a w-bit window is entirely zeroes, that window will be skipped.         */
+    /*                                                                              */
+    /* The last row will be smaller so that the window stops at the 257th bit.      */
+    /* We go to 257 bits instead of 256 to account for a possible high 1 bit after  */
+    /*   converting the privkey scalar to a signed digit form.                      */
+    /*                                                                              */
+    /* We use ge_storage instead of regular ge to save ~25% more space.             */
+    secp256k1_ge_storage **precomp;
+
+    /* Holds a single row in the precomputation table before converting to affine.  */
+    /* This memory will be freed after creating the precomputation table.           */
+    secp256k1_gej *gej_temp;
+
+    /* Holds the Z ratios between each temp row element's Jacobian points.          */
+    /* Used to convert to affine with a single field element inversion.             */
+    /* This memory will be freed after creating the precomputation table.           */
+    secp256k1_fe *z_ratio;
+};
+
+/** Create a secp256k1 ecmult big context.
+ *
+ *  Returns: a newly created ecmult big context.
+ *  Args:   ctx:    pointer to a context object, initialized for signing (cannot be NULL)
+ *  In:     bits:   the window size in bits for the precomputation table
+ */
+secp256k1_ecmult_big_context* secp256k1_ecmult_big_create(const secp256k1_context* ctx, const unsigned int bits) {
+    unsigned int windows;
+    size_t window_size, total_size;
+    size_t i, row;
+
+    secp256k1_fe  fe_zinv;
+    secp256k1_ge  ge_temp;
+    secp256k1_ge  ge_window_one = secp256k1_ge_const_g;
+    secp256k1_gej gej_window_base;
+    secp256k1_ecmult_big_context *rtn;
+
+
+    /* No point using fewer bits than the default implementation. */
+    ARG_CHECK(bits >=  4);
+
+    /* Each signed digit result must fit in a int64_t, we can't be larger.      */
+    /* We also possibly subtract (1 << bits) and can't shift into the sign bit. */
+    ARG_CHECK(bits <= 62);
+
+    /* We +1 to account for a possible high 1 bit after converting the privkey to signed digit form.    */
+    /* This means our table reaches to 257 bits even though the privkey scalar is at most 256 bits.     */
+    windows = (256 / bits) + 1;
+    window_size = (1 << (bits - 1));
+
+    /* Total number of required point storage elements.                                 */
+    /* This differs from the (windows * window_size) because the last row can be shrunk */
+    /*   as it only needs to extend enough to include a possible 1 in the 257th bit.    */
+    total_size = (256 / bits) * window_size + (1 << (256 % bits));
+
+
+
+    /**************** Allocate Struct Members *****************/
+    rtn = (secp256k1_ecmult_big_context *)checked_malloc(&ctx->error_callback, sizeof(secp256k1_ecmult_big_context));
+    *(unsigned int *)(&rtn->bits) = bits;
+    *(unsigned int *)(&rtn->windows) = windows;
+
+    /* An array of secp256k1_ge_storage pointers, one for each window. */
+    rtn->precomp = (secp256k1_ge_storage **)checked_malloc(&ctx->error_callback, sizeof(secp256k1_ge_storage *) * windows);
+
+    /* Bulk allocate up front.  We'd rather run out of memory now than during computation.  */
+    /* Only the 0th row is malloc'd, the rest will be updated to point to row starts        */
+    /*   within the giant chunk of memory that we've allocated.                             */
+    rtn->precomp[0] = (secp256k1_ge_storage *)checked_malloc(&ctx->error_callback, sizeof(secp256k1_ge_storage) * total_size);
+
+    /* Each row starts window_size elements after the previous. */
+    for ( i = 1; i < windows; i++ ) { rtn->precomp[i] = (rtn->precomp[i - 1] + window_size); }
+
+    rtn->gej_temp = (secp256k1_gej *)checked_malloc(&ctx->error_callback, sizeof(secp256k1_gej) * window_size);
+    rtn->z_ratio  = (secp256k1_fe  *)checked_malloc(&ctx->error_callback, sizeof(secp256k1_fe ) * window_size);
+
+
+
+    /************ Precomputed Table Initialization ************/
+    secp256k1_gej_set_ge(&gej_window_base, &ge_window_one);
+
+    /* This is the same for all windows.    */
+    secp256k1_fe_set_int(&(rtn->z_ratio[0]), 0);
+
+
+    for ( row = 0; row < windows; row++ ) {
+        /* The last row is a bit smaller, only extending to include the 257th bit. */
+        window_size = ( row == windows - 1 ? (1 << (256 % bits)) : (1 << (bits - 1)) );
+
+        /* The base element of each row is 2^bits times the previous row's base. */
+        if ( row > 0 ) {
+            for ( i = 0; i < bits; i++ ) { secp256k1_gej_double_var(&gej_window_base, &gej_window_base, NULL); }
+        }
+        rtn->gej_temp[0] = gej_window_base;
+
+        /* The base element is also our "one" value for this row.   */
+        /* If we are at offset 2^X, adding "one" should add 2^X.    */
+        secp256k1_ge_set_gej(&ge_window_one, &gej_window_base);
+
+
+        /* Repeated + 1s to fill the rest of the row.   */
+
+        /* We capture the Z ratios between consecutive points for quick Z inversion.    */
+        /*   gej_temp[i-1].z * z_ratio[i] => gej_temp[i].z                              */
+        /* This means that z_ratio[i] = (gej_temp[i-1].z)^-1 * gej_temp[i].z            */
+        /* If we know gej_temp[i].z^-1, we can get gej_temp[i-1].z^1 using z_ratio[i]   */
+        /* Visually:                                    */
+        /* i            0           1           2       */
+        /* gej_temp     a           b           c       */
+        /* z_ratio     NaN      (a^-1)*b    (b^-1)*c    */
+        for ( i = 1; i < window_size; i++ ) {
+            secp256k1_gej_add_ge_var(&(rtn->gej_temp[i]), &(rtn->gej_temp[i-1]), &ge_window_one, &(rtn->z_ratio[i]));
+        }
+
+
+        /* An unpacked version of secp256k1_ge_set_table_gej_var() that works   */
+        /*   element by element instead of requiring a secp256k1_ge *buffer.    */
+
+        /* Invert the last Z coordinate manually.   */
+        i = window_size - 1;
+        secp256k1_fe_inv(&fe_zinv, &(rtn->gej_temp[i].z));
+        secp256k1_ge_set_gej_zinv(&ge_temp, &(rtn->gej_temp[i]), &fe_zinv);
+        secp256k1_ge_to_storage(&(rtn->precomp[row][i]), &ge_temp);
+
+        /* Use the last element's known Z inverse to determine the previous' Z inverse. */
+        for ( ; i > 0; i-- ) {
+            /* fe_zinv = (gej_temp[i].z)^-1                 */
+            /* (gej_temp[i-1].z)^-1 = z_ratio[i] * fe_zinv  */
+            secp256k1_fe_mul(&fe_zinv, &fe_zinv, &(rtn->z_ratio[i]));
+            /* fe_zinv = (gej_temp[i-1].z)^-1               */
+
+            secp256k1_ge_set_gej_zinv(&ge_temp, &(rtn->gej_temp[i-1]), &fe_zinv);
+            secp256k1_ge_to_storage(&(rtn->precomp[row][i-1]), &ge_temp);
+        }
+    }
+
+
+    /* We won't be using these any more.    */
+    free(rtn->gej_temp); rtn->gej_temp = NULL;
+    free(rtn->z_ratio);  rtn->z_ratio  = NULL;
+
+    return rtn;
+}
+
+
+/** Destroy a secp256k1 ecmult big context.
+ *
+ *  The context pointer may not be used afterwards.
+ *  Args:   bmul:   an existing context to destroy (cannot be NULL)
+ */
+void secp256k1_ecmult_big_destroy(secp256k1_ecmult_big_context* bmul) {
+    VERIFY_CHECK(bmul != NULL);
+    if ( bmul == NULL ) { return; }
+
+    /* Just in case the caller tries to use after free. */
+    *(unsigned int *)(&bmul->bits)    = 0;
+    *(unsigned int *)(&bmul->windows) = 0;
+
+    if ( bmul->precomp != NULL ) {
+        /* This was allocated with a single malloc, it will be freed with a single free. */
+        if ( bmul->precomp[0] != NULL ) { free(bmul->precomp[0]); bmul->precomp[0] = NULL; }
+
+        free(bmul->precomp); bmul->precomp = NULL;
+    }
+
+    /* These should already be freed, but just in case. */
+    if ( bmul->gej_temp != NULL ) { free(bmul->gej_temp); bmul->gej_temp = NULL; }
+    if ( bmul->z_ratio  != NULL ) { free(bmul->z_ratio ); bmul->z_ratio  = NULL; }
+
+    free(bmul);
+}
+
+
+
+/** Shifts and returns the first N <= 64 bits from a scalar.
+ *  The default secp256k1_scalar_shr_int only handles up to 15 bits.
+ *
+ *  Args:   s:      a scalar object to shift from (cannot be NULL)
+ *  In:     n:      number of bits to shift off and return
+ */
+uint64_t secp256k1_scalar_shr_any(secp256k1_scalar *s, unsigned int n) {
+    unsigned int cur_shift = 0, offset = 0;
+    uint64_t rtn = 0;
+
+    VERIFY_CHECK(s != NULL);
+    VERIFY_CHECK(n >   0);
+    VERIFY_CHECK(n <= 64);
+
+    while ( n > 0 ) {
+        /* Shift up to 15 bits at a time, or N bits, whichever is smaller.  */
+        /* secp256k1_scalar_shr_int() is hard limited to (0 < n < 16).      */
+        cur_shift = ( n > 15 ? 15 : n );
+
+        rtn |= ((uint64_t)secp256k1_scalar_shr_int(s, cur_shift) << (uint64_t)offset);
+
+        offset += cur_shift;
+        n      -= cur_shift;
+    }
+
+    return rtn;
+}
+
+
+/** Converts the lowest w-bit window of scalar s into signed binary form
+ *
+ *  Returns: signed form of the lowest w-bit window
+ *  Args:   s:  scalar to read from and modified (cannot be NULL)
+ *  In:     w:  window size in bits (w < 64)
+ */
+static int64_t secp256k1_scalar_sdigit_single(secp256k1_scalar *s, unsigned int w) {
+    int64_t sdigit = 0;
+
+    /* Represents a 1 bit in the next window's least significant bit.       */
+    /* VERIFY_CHECK verifies that (1 << w) won't touch int64_t's sign bit.  */
+    int64_t overflow_bit = (int64_t)(1 << w);
+
+    /* Represents the maximum positive value in a w-bit precomp table.  */
+    /* Values greater than this are converted to negative values and    */
+    /*   will "reverse borrow" a bit from the next window.              */
+    int64_t precomp_max = (int64_t)(1 << (w-1));
+
+    VERIFY_CHECK(s != NULL);
+    VERIFY_CHECK(w >=  1);
+    VERIFY_CHECK(w <= 62);
+
+    sdigit = (int64_t)secp256k1_scalar_shr_any(s, w);
+
+    if ( sdigit <= precomp_max ) {
+        /* A w-bit precomp table has this digit as a positive value, return as-is.  */
+        return sdigit;
+
+    } else {
+        secp256k1_scalar one;
+        secp256k1_scalar_set_int(&one, 1);
+
+        /* Convert this digit to a negative value, but balance s by adding it's value.  */
+        /* Subtracting our sdigit value carries over into a 1 bit of the next digit.    */
+        /* Since s has been shifted down w bits, s += 1 does the same thing.            */
+        sdigit -= overflow_bit;
+
+        secp256k1_scalar_add(s, s, &one);
+
+        return sdigit;
+    }
+}
+
+
+/** Converts s to a signed digit form using w-bit windows.
+ *
+ *  Returns: number of signed digits written, some digits may be zero
+ *  Out:    sdigits:    signed digit representation of s (cannot be NULL)
+ *  In:     s:          scalar value to convert to signed digit form
+ *          w:          window size in bits
+ */
+static size_t secp256k1_scalar_sdigit(int64_t *sdigits, secp256k1_scalar s, unsigned int w) {
+    size_t digits = 0;
+
+    VERIFY_CHECK(sdigits != NULL);
+    VERIFY_CHECK(w >=  1);
+    VERIFY_CHECK(w <= 62);
+
+    while ( !secp256k1_scalar_is_zero(&s) ) {
+        sdigits[digits] = secp256k1_scalar_sdigit_single(&s, w);
+        digits++;
+    }
+
+    return digits;
+}
+
+
+
+/** Multiply with the generator: R = a*G.
+ *
+ *  Args:   bmul:   pointer to an ecmult_big_context (cannot be NULL)
+ *  Out:    r:      set to a*G where G is the generator (cannot be NULL)
+ *  In:     a:      the scalar to multiply the generator by (cannot be NULL)
+ */
+static void secp256k1_ecmult_big(const secp256k1_ecmult_big_context* bmul, secp256k1_gej *r, const secp256k1_scalar *a) {
+    size_t  window = 0;
+    int64_t sdigit = 0;
+    secp256k1_ge window_value;
+
+    /* Copy of the input scalar which secp256k1_scalar_sdigit_single will destroy. */
+    secp256k1_scalar privkey = *a;
+
+    VERIFY_CHECK(bmul != NULL);
+    VERIFY_CHECK(bmul->bits > 0);
+    VERIFY_CHECK(r != NULL);
+    VERIFY_CHECK(a != NULL);
+
+    /* Until we hit a non-zero window, the value of r is undefined. */
+    secp256k1_gej_set_infinity(r);
+
+    /* If the privkey is zero, bail. */
+    if ( secp256k1_scalar_is_zero(&privkey) ) { return; }
+
+
+    /* Incrementally convert the privkey into signed digit form, one window at a time. */
+    while ( window < bmul->windows && !secp256k1_scalar_is_zero(&privkey) ) {
+        sdigit = secp256k1_scalar_sdigit_single(&privkey, bmul->bits);
+
+        /* Zero windows have no representation in our precomputed table. */
+        if ( sdigit != 0 ) {
+            if ( sdigit < 0 ) {
+                /* Use the positive precomp index and negate the result. */
+                secp256k1_ge_from_storage(&window_value, &(bmul->precomp[window][ -(sdigit) - 1 ]));
+                secp256k1_ge_neg(&window_value, &window_value);
+            } else {
+                /* Use the precomp index and result as-is.  */
+                secp256k1_ge_from_storage(&window_value, &(bmul->precomp[window][ +(sdigit) - 1 ]));
+            }
+
+            /* The first addition is automatically replaced by a load when r = inf. */
+            secp256k1_gej_add_ge_var(r, r, &window_value, NULL);
+        }
+
+        window++;
+    }
+
+    /* If privkey isn't zero, something broke.  */
+    VERIFY_CHECK(secp256k1_scalar_is_zero(&privkey));
+}
+
+/* Scratch space for secp256k1_ec_pubkey_create_batch's temporary results. */
+struct secp256k1_scratch_struct {
+    /* Maximum number of elements this scratch space can hold. */
+    const size_t size;
+
+    /* Output from individual secp256k1_ecmult_gen. */
+    secp256k1_gej *gej;
+
+    /* Input and output buffers for secp256k1_fe_inv_all_var. */
+    secp256k1_fe  *fe_in;
+    secp256k1_fe  *fe_out;
+};
+
+
+secp256k1_scratch* secp256k1_scratch_create(const secp256k1_context* ctx, const size_t size) {
+    secp256k1_scratch* rtn = (secp256k1_scratch *)checked_malloc(&ctx->error_callback, sizeof(secp256k1_scratch));
+
+    /* Cast away const-ness to set the size value.  */
+    /* http://stackoverflow.com/a/9691556/477563    */
+    *(size_t *)&rtn->size = size;
+
+    rtn->gej    = (secp256k1_gej*)checked_malloc(&ctx->error_callback, sizeof(secp256k1_gej) * size);
+    rtn->fe_in  = (secp256k1_fe *)checked_malloc(&ctx->error_callback, sizeof(secp256k1_fe ) * size);
+    rtn->fe_out = (secp256k1_fe *)checked_malloc(&ctx->error_callback, sizeof(secp256k1_fe ) * size);
+
+    return rtn;
+}
+
+
+void secp256k1_scratch_destroy(secp256k1_scratch* scr) {
+    if (scr != NULL) {
+        /* Just in case the caller tries to reuse this scratch space, set size to zero.     */
+        /* Functions that use this scratch space will reject scratches that are undersized. */
+        *(size_t *)&scr->size = 0;
+
+        if ( scr->gej    != NULL ) { free(scr->gej   ); scr->gej    = NULL; }
+        if ( scr->fe_in  != NULL ) { free(scr->fe_in ); scr->fe_in  = NULL; }
+        if ( scr->fe_out != NULL ) { free(scr->fe_out); scr->fe_out = NULL; }
+
+        free(scr);
+    }
+}
+
+
+
+size_t secp256k1_ec_pubkey_create_serialized(const secp256k1_context *ctx, const secp256k1_ecmult_big_context *bmul, unsigned char *pubkey, const unsigned char *privkey, const unsigned int compressed) {
+    /* Creating our own 1 element scratch structure. */
+    secp256k1_gej gej;
+    secp256k1_fe  fe_in, fe_out;
+    secp256k1_scratch scr = {1, &gej, &fe_in, &fe_out};
+
+    /* Defer the actual work to _batch, no point repeating code. */
+    return secp256k1_ec_pubkey_create_serialized_batch(ctx, bmul, &scr, pubkey, privkey, 1, compressed);
+}
+
+
+size_t secp256k1_ec_pubkey_create_serialized_batch(const secp256k1_context *ctx, const secp256k1_ecmult_big_context *bmul, secp256k1_scratch *scr, unsigned char *pubkeys, const unsigned char *privkeys, const size_t key_count, const unsigned int compressed) {
+    secp256k1_scalar s_privkey;
+    secp256k1_ge ge_pubkey;
+    size_t i, dummy, out_keys;
+    size_t pubkey_size = ( compressed ? 33 : 65 );
+
+    /* Argument checking. */
+    ARG_CHECK(ctx != NULL);
+    ARG_CHECK(secp256k1_ecmult_gen_context_is_built(&ctx->ecmult_gen_ctx));
+
+    ARG_CHECK(scr         != NULL);
+    ARG_CHECK(scr->gej    != NULL);
+    ARG_CHECK(scr->fe_in  != NULL);
+    ARG_CHECK(scr->fe_out != NULL);
+
+    ARG_CHECK(pubkeys  != NULL);
+
+    ARG_CHECK(privkeys != NULL);
+
+    ARG_CHECK(key_count <= scr->size);
+
+
+    /* Blank all of the output, regardless of what happens.                 */
+    /* This marks all output keys as invalid until successfully created.    */
+    memset(pubkeys, 0, sizeof(*pubkeys) * pubkey_size * key_count);
+
+    out_keys = 0;
+
+    for ( i = 0; i < key_count; i++ ) {
+        /* Convert private key to scalar form. */
+        secp256k1_scalar_set_b32(&s_privkey, &(privkeys[32 * i]), NULL);
+
+        /* Reject the privkey if it's zero or has reduced to zero. */
+        /* Mark the corresponding Jacobian pubkey as infinity so we know to skip this key later. */
+        if ( secp256k1_scalar_is_zero(&s_privkey) ) {
+            scr->gej[i].infinity = 1;
+            continue;
+        }
+
+
+        /* Multiply the private key by the generator point. */
+        if ( bmul != NULL ) {
+            /* Multiplication using larger, faster, precomputed tables. */
+            secp256k1_ecmult_big(bmul, &(scr->gej[i]), &s_privkey);
+        } else {
+            /* Multiplication using default implementation. */
+            secp256k1_ecmult_gen(&ctx->ecmult_gen_ctx, &(scr->gej[i]), &s_privkey);
+        }
+
+        /* If the result is the point at infinity, the pubkey is invalid. */
+        if ( scr->gej[i].infinity ) { continue; }
+
+
+        /* Save the Jacobian pubkey's Z coordinate for batch inversion. */
+        scr->fe_in[out_keys] = scr->gej[i].z;
+        out_keys++;
+    }
+
+
+    /* Assuming we have at least one non-infinite Jacobian pubkey. */
+    if ( out_keys > 0 ) {
+        /* Invert all Jacobian public keys' Z values in one go. */
+        secp256k1_fe_inv_all_var(out_keys, scr->fe_out, scr->fe_in);
+    }
+
+
+    /* Using the inverted Z values, convert each Jacobian public key to affine, */
+    /*   then serialize the affine version to the pubkey buffer.                */
+    out_keys = 0;
+
+    for ( i = 0; i < key_count; i++) {
+        /* Skip inverting infinite values. */
+        /* The corresponding pubkey is already filled with \0 bytes from earlier. */
+        if ( scr->gej[i].infinity ) {
+            continue;
+        }
+
+        /* Otherwise, load the next inverted Z value and convert the pubkey to affine coordinates. */
+        secp256k1_ge_set_gej_zinv(&ge_pubkey, &(scr->gej[i]), &(scr->fe_out[out_keys]));
+
+        /* Serialize the public key into the requested format. */
+        secp256k1_eckey_pubkey_serialize(&ge_pubkey, &(pubkeys[pubkey_size * i]), &dummy, compressed);
+        out_keys++;
+    }
+
+
+    /* Returning the number of successfully converted private keys. */
+    return out_keys;
+}
+
+
 #ifdef ENABLE_MODULE_ECDH
 # include "modules/ecdh/main_impl.h"
 #endif
